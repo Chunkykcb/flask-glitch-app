@@ -41,6 +41,10 @@ def webhook():
         stop_loss_price = entry_price - stop_loss_multiplier
         take_profit_price = entry_price + take_profit_multiplier * (entry_price - stop_loss_price)
 
+        # Round the stop loss and take profit prices to 2 decimal places
+        stop_loss_price = round(stop_loss_price, 2)
+        take_profit_price = round(take_profit_price, 2)
+
         # Adjust position size to match $1000 risk (adjust for slippage)
         stop_loss_dist = abs(entry_price - stop_loss_price)
         pos_size_risk_based = risk_dollar / stop_loss_dist  # Risk-based position size
@@ -51,36 +55,30 @@ def webhook():
         # Final position size: the smaller value between risk-based size and the max position size
         pos_size = min(pos_size_risk_based, max_position_size)
 
+        # Create the market order (Long or Short) and set the OCO (Stop-Loss & Take-Profit) orders
         try:
-            # Simulate order (Don't actually send to Alpaca)
-            order_data = {
-                "symbol": symbol,
-                "qty": math.floor(pos_size),  # Ensure integer qty for Alpaca
-                "side": 'buy',
-                "type": 'market',
-                "time_in_force": 'gtc',
-            }
-            # Log the order data for inspection
-            print(f"Simulated Order Data: {json.dumps(order_data, indent=2)}")
+            # Submit the buy order
+            market_order = api.submit_order(
+                symbol=symbol,
+                qty=math.floor(pos_size),  # Ensure integer qty for Alpaca
+                side='buy',
+                type='market',
+                time_in_force='gtc'  # Good till canceled
+            )
 
-            # Simulate OCO order
-            oco_order_data = {
-                "symbol": symbol,
-                "qty": math.floor(pos_size),
-                "side": 'sell',
-                "type": 'oco',  # OCO order type
-                "stop_loss": {'stop_price': stop_loss_price, 'limit_price': stop_loss_price * 0.99},
-                "take_profit": {'limit_price': take_profit_price},
-                "time_in_force": 'gtc'
-            }
-            # Log the OCO order data for inspection
-            print(f"Simulated OCO Order Data: {json.dumps(oco_order_data, indent=2)}")
+            # Place OCO (One Cancels Other) order: One for stop loss, one for take profit
+            oco_order = api.submit_order(
+                symbol=symbol,
+                qty=math.floor(pos_size),
+                side='sell',
+                type='oco',  # OCO order type
+                stop_loss={'stop_price': stop_loss_price, 'limit_price': stop_loss_price * 0.99},
+                take_profit={'limit_price': take_profit_price},
+                time_in_force='gtc'
+            )
 
-            # Return a response indicating success without submitting the actual order
             return jsonify({
-                "message": "Simulated order successfully generated (no trade executed)",
-                "order_data": order_data,
-                "oco_order_data": oco_order_data
+                "message": f"Buy order placed for {symbol} with OCO stop loss at {stop_loss_price} and take profit at {take_profit_price}"
             }), 200
 
         except Exception as e:
