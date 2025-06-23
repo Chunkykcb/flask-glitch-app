@@ -51,9 +51,8 @@ def webhook():
         # Final position size: the smaller value between risk-based size and the max position size
         pos_size = min(pos_size_risk_based, max_position_size)
 
-        # Create the market order (Long or Short) and set the OCO (Stop-Loss & Take-Profit) orders
         try:
-            # Submit the buy order
+            # Submit the buy market order
             market_order = api.submit_order(
                 symbol=symbol,
                 qty=math.floor(pos_size),  # Ensure integer qty for Alpaca
@@ -62,14 +61,19 @@ def webhook():
                 time_in_force='gtc'  # Good till canceled
             )
 
-            # Place OCO (One Cancels Other) order: One for stop loss, one for take profit
+            # Place the OCO order (stop loss + take profit)
             oco_order = api.submit_order(
                 symbol=symbol,
                 qty=math.floor(pos_size),
                 side='sell',
                 type='oco',  # OCO order type
-                stop_loss={'stop_price': stop_loss_price, 'limit_price': stop_loss_price * 0.99},
-                take_profit={'limit_price': take_profit_price},
+                stop_loss={
+                    'stop_price': stop_loss_price, 
+                    'limit_price': stop_loss_price * 0.99  # Ensure slippage on stop loss
+                },
+                take_profit={
+                    'limit_price': take_profit_price
+                },
                 time_in_force='gtc'
             )
 
