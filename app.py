@@ -8,8 +8,8 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # Alpaca API setup (make sure you set up your keys in the environment variables or directly)
-API_KEY = 'your_alpaca_api_key'
-API_SECRET = 'your_alpaca_api_secret'
+API_KEY = 'PKEBE9SZ9SBF38BCV2MO'
+API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq'
 BASE_URL = 'https://paper-api.alpaca.markets'  # Use for paper trading
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
