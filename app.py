@@ -27,8 +27,7 @@ CORS(app)  # Enable CORS for all routes (useful if you have a frontend interacti
 # --- Alpaca API Setup ---
 # Load API keys securely from environment variables provided by Render
 API_KEY = os.environ.get('PKEBE9SZ9SBF38BCV2MO')
-API_SECRET = os.environ.get('
-KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq')
+API_SECRET = os.environ.get('KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq')
 # Use the paper trading URL for testing. Change to 'https://api.alpaca.markets' for live trading.
 BASE_URL = 'https://paper-api.alpaca.markets' 
 
@@ -52,7 +51,7 @@ else:
 RISK_DOLLAR = Decimal('1000.0')   # Max dollar amount to risk per trade
 STOP_LOSS_PERCENT = Decimal('0.005') # 0.5% stop loss relative to entry price
 TAKE_PROFIT_RATIO = Decimal('2.0')   # Take profit target is 2 times the risk distance
-MAX_CAPITAL_ALLOCATION = Decimal('25000.0') # Max total capital to allocate per trade
+MAX_CAPITAL_ALLOCATION = Decimal('10000.0') # Max total capital to allocate per trade
 
 # --- Home Route (for basic health check) ---
 @app.route('/')
