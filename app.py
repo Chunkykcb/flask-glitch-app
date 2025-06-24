@@ -100,6 +100,14 @@ def webhook():
             take_profit_price = entry_price * (Decimal('1') - (STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO))
             stop_loss_limit_price = stop_loss_price * Decimal('1.01')
 
+        # Round stop-loss and take-profit prices to two decimal places
+        stop_loss_price = stop_loss_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')
+        take_profit_price = take_profit_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
+        stop_loss_limit_price = stop_loss_limit_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')
+
+        # Log the rounded prices for debugging
+        logging.info(f"Rounded SL={stop_loss_price}, TP={take_profit_price}")
+
         # Basic validation for stop-loss and take-profit prices
         if stop_loss_price <= 0 or take_profit_price <= 0:
             logging.error(f"Invalid SL/TP prices: SL={stop_loss_price}, TP={take_profit_price}")
