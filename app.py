@@ -26,8 +26,9 @@ CORS(app)  # Enable CORS for all routes (useful if you have a frontend interacti
 
 # --- Alpaca API Setup ---
 # Load API keys securely from environment variables provided by Render
-API_KEY = os.environ.get('ALPACA_API_KEY')
-API_SECRET = os.environ.get('ALPACA_SECRET_KEY')
+API_KEY = os.environ.get('PKEBE9SZ9SBF38BCV2MO')
+API_SECRET = os.environ.get('
+KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq')
 # Use the paper trading URL for testing. Change to 'https://api.alpaca.markets' for live trading.
 BASE_URL = 'https://paper-api.alpaca.markets' 
 
