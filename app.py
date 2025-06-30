@@ -145,76 +145,24 @@ def webhook():
         if qty <= 0:
             return jsonify({"message": "Calculated position size is zero."}), 200
 
-        logging.info(f"Submitting final order for {qty} shares at side {side} with SL={sl}, TP={tp}")
+        logging.info(f"Submitting final bracket order for {qty} shares at side {side} with SL={sl}, TP={tp}")
 
-        # Submit final market order with correct qty
-        final_order = api.submit_order(
+        # Submit final market order with bracket (SL + TP) based on fill price from probe
+        bracket_order = api.submit_order(
             symbol=symbol,
             qty=qty,
             side=side,
             type='market',
-            time_in_force='gtc'
+            time_in_force='gtc',
+            order_class='bracket',
+            take_profit={"limit_price": float(tp)},
+            stop_loss={"stop_price": float(sl)}
         )
 
-        # Wait for fill
-        for _ in range(10):
-            fo_status = api.get_order(final_order.id)
-            if fo_status.filled_at:
-                break
-            time.sleep(1)
-
-        fo_status = api.get_order(final_order.id)
-        if not fo_status.filled_at:
-            api.cancel_order(final_order.id)
-            return jsonify({"error": "Final order did not fill in time."}), 500
-
-        filled_price = Decimal(fo_status.filled_avg_price)
-
-        # Recalculate SL/TP with actual fill price
-        if side == 'buy':
-            sl = (filled_price * (1 - STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
-            tp = (filled_price * (1 + STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-        else:
-            sl = (filled_price * (1 + STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
-            tp = (filled_price * (1 - STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-
-        # Submit SL order
-        sl_order = api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side='sell' if side == 'buy' else 'buy',
-            type='stop',
-            stop_price=float(sl),
-            time_in_force='gtc'
-        )
-        # Submit TP order
-        tp_order = api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side='sell' if side == 'buy' else 'buy',
-            type='limit',
-            limit_price=float(tp),
-            time_in_force='gtc'
-        )
-
-        logging.info(f"Submitted SL ({sl_order.id}) and TP ({tp_order.id}) orders.")
-
-        # Poll for fill on SL/TP for up to 60s
-        for _ in range(60):
-            sl_status = api.get_order(sl_order.id)
-            tp_status = api.get_order(tp_order.id)
-            if sl_status.filled_at:
-                api.cancel_order(tp_order.id)
-                logging.info("Stop-loss filled, take-profit canceled.")
-                break
-            elif tp_status.filled_at:
-                api.cancel_order(sl_order.id)
-                logging.info("Take-profit filled, stop-loss canceled.")
-                break
-            time.sleep(1)
+        logging.info(f"Bracket order submitted with SL={sl}, TP={tp}, Qty={qty}")
 
         return jsonify({
-            "message": f"Order filled at {filled_price}, SL={sl}, TP={tp}, Qty={qty}"
+            "message": f"Bracket order submitted based on entry price {filled_price}, SL={sl}, TP={tp}, Qty={qty}"
         }), 200
 
     except tradeapi.rest.APIError as e:
