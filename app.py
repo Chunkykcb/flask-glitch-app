@@ -1,164 +1,228 @@
 import os
+import time
 import logging
 import alpaca_trade_api as tradeapi
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from decimal import Decimal, getcontext # Import getcontext for precision setting
+from decimal import Decimal, getcontext
 import math
-import json # Added for logging full JSON data, good for debugging webhook payloads
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
 
-# Set Decimal precision - Good practice for financial calculations
-getcontext().prec = 10 
+# --- Precision for Decimal ---
+getcontext().prec = 10
 
-# --- Logging Configuration ---
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('app.log')
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler('app.log')]
 )
 
 app = Flask(__name__)
 CORS(app)
 
 # --- Alpaca API Setup ---
-# Directly using your Alpaca API key and secret (hard-coded for testing purposes)
-API_KEY = 'PKEBE9SZ9SBF38BCV2MO'  # Replace with your actual API key
-API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq'  # Replace with your actual API secret
-BASE_URL = 'https://paper-api.alpaca.markets'  # Paper trading URL
+API_KEY = 'PKEBE9SZ9SBF38BCV2MO'
+API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq'
+BASE_URL = 'https://paper-api.alpaca.markets'
 
-# Initialize Alpaca API client
 api = None
-if not API_KEY or not API_SECRET:
-    logging.error("ALPACA_API_KEY or ALPACA_SECRET_KEY environment variables are not set. API will not be initialized.")
-else:
-    try:
-        api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-        api.get_account()  # Test connection to Alpaca
-        logging.info("Alpaca API initialized and connected successfully.")
-    except Exception as e:
-        logging.error(f"Failed to connect to Alpaca API: {e}", exc_info=True)
-        api = None
+try:
+    api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+    api.get_account()
+    logging.info("Alpaca API initialized successfully.")
+except Exception as e:
+    logging.error(f"Alpaca API initialization failed: {e}", exc_info=True)
 
-# --- Constants for Risk Management ---
+# --- Risk Management Settings ---
 RISK_DOLLAR = Decimal('1000.0')
 STOP_LOSS_PERCENT = Decimal('0.005')
 TAKE_PROFIT_RATIO = Decimal('2.0')
 MAX_CAPITAL_ALLOCATION = Decimal('10000.0')
 
-# --- Home Route (Health check) ---
+# --- Timezone Setup ---
+PT = ZoneInfo("America/Los_Angeles")
+CUTOFF_HOUR = 12
+CUTOFF_MINUTE = 55
+
+def is_after_cutoff():
+    now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+    now_pt = now_utc.astimezone(PT)
+    cutoff_pt = now_pt.replace(hour=CUTOFF_HOUR, minute=CUTOFF_MINUTE, second=0, microsecond=0)
+    return now_pt >= cutoff_pt
+
 @app.route('/')
 def home():
-    return "Welcome to the Flask Webhook App! Listening for TradingView alerts."
+    return "Webhook trading bot running."
 
-# --- Main Webhook Route ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    if api is None:
-        logging.error("Alpaca API not initialized. Cannot process webhook.")
-        return jsonify({"error": "Server not configured for trading."}), 500
+    if not api:
+        return jsonify({"error": "Alpaca not initialized."}), 500
 
-    data = request.get_json()  # Get the webhook payload
+    data = request.get_json()
     logging.info(f"Received webhook data: {json.dumps(data)}")
 
-    # Extract data from the webhook
     symbol = data.get('symbol')
     entry_price_raw = data.get('price')
     action = data.get('action')
+    qty_raw = data.get('qty', None)  # qty might come in webhook payload
 
-    # Validate data
-    if not all([symbol, entry_price_raw, action]):
-        logging.error("Missing required data in webhook payload.")
-        return jsonify({"error": "Missing required data (symbol, price, or action)"}), 400
+    if not all([symbol, action]):
+        return jsonify({"error": "Missing required fields."}), 400
+
+    # Handle qty=0 signals specially
+    if qty_raw == 0 or qty_raw == '0':
+        if is_after_cutoff():
+            logging.info(f"Qty=0 received after cutoff time, closing all positions.")
+            try:
+                positions = api.list_positions()
+                for position in positions:
+                    logging.info(f"Closing position for {position.symbol}, qty: {position.qty}")
+                    api.close_position(position.symbol)
+                return jsonify({"message": "Closed all positions after cutoff."}), 200
+            except Exception as e:
+                logging.error(f"Error closing positions: {e}", exc_info=True)
+                return jsonify({"error": "Failed to close all positions."}), 500
+        else:
+            logging.info(f"Qty=0 received before cutoff time, ignoring signal.")
+            return jsonify({"message": "Ignored qty=0 signal before cutoff time."}), 200
+
+    # For non-zero qty or no qty signals, process normally
 
     try:
-        entry_price = Decimal(str(entry_price_raw))
-        if entry_price <= 0:
-            logging.error(f"Invalid entry_price ({entry_price}) for {symbol}.")
-            return jsonify({"error": "Invalid entry price."}), 400
-    except Exception as e:
-        logging.error(f"Error converting entry_price '{entry_price_raw}' for {symbol}: {e}")
-        return jsonify({"error": "Invalid price format."}), 400
+        entry_price = Decimal(str(entry_price_raw)) if entry_price_raw else None
+    except Exception:
+        entry_price = None
 
-    if action not in ['buy', 'sell']:
-        logging.error(f"Invalid action '{action}' for {symbol}.")
+    side = 'buy' if action == 'buy' else 'sell' if action == 'sell' else None
+
+    if side is None:
         return jsonify({"error": "Invalid action."}), 400
 
-    side = 'buy' if action == 'buy' else 'sell'
-    logging.info(f"Processing '{action}' signal for {symbol} at price: {entry_price}")
+    if not entry_price:
+        logging.warning(f"No valid entry price provided, will fetch fill price after order execution.")
 
     try:
-        # Calculate Stop Loss and Take Profit
-        if side == 'buy':
-            stop_loss_price = entry_price * (Decimal('1') - STOP_LOSS_PERCENT)
-            take_profit_price = entry_price * (Decimal('1') + (STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO))
-            stop_loss_limit_price = stop_loss_price * Decimal('0.99')
-        else:
-            stop_loss_price = entry_price * (Decimal('1') + STOP_LOSS_PERCENT)
-            take_profit_price = entry_price * (Decimal('1') - (STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO))
-            stop_loss_limit_price = stop_loss_price * Decimal('1.01')
-
-        # Round stop-loss and take-profit prices to two decimal places
-        stop_loss_price = stop_loss_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')
-        take_profit_price = take_profit_price.quantize(Decimal('0.01'), rounding='ROUND_UP')
-        stop_loss_limit_price = stop_loss_limit_price.quantize(Decimal('0.01'), rounding='ROUND_DOWN')
-
-        # Log the rounded prices for debugging
-        logging.info(f"Rounded SL={stop_loss_price}, TP={take_profit_price}")
-
-        # Basic validation for stop-loss and take-profit prices
-        if stop_loss_price <= 0 or take_profit_price <= 0:
-            logging.error(f"Invalid SL/TP prices: SL={stop_loss_price}, TP={take_profit_price}")
-            return jsonify({"error": "Invalid stop loss or take profit price."}), 400
-
-        stop_loss_dist = abs(entry_price - stop_loss_price)
-        if stop_loss_dist == 0:
-            logging.error("Stop loss distance is zero.")
-            return jsonify({"error": "Invalid stop loss distance."}), 400
-
-        pos_size_risk_based = RISK_DOLLAR / stop_loss_dist
-        max_position_size = MAX_CAPITAL_ALLOCATION / entry_price
-
-        final_qty = math.floor(min(pos_size_risk_based, max_position_size))
-
-        if final_qty <= 0:
-            logging.warning(f"Calculated position size is zero for {symbol}.")
-            return jsonify({"message": f"Position size is zero for {symbol}."}), 200
-
-        logging.info(f"Final Quantity for {symbol}: {final_qty} shares. SL={stop_loss_price:.4f}, TP={take_profit_price:.4f}")
-
-        # Submit Bracket Order
-        bracket_order = api.submit_order(
+        # Place a small initial market order to get filled price for sizing
+        temp_order = api.submit_order(
             symbol=symbol,
-            qty=int(final_qty),
+            qty=1,
             side=side,
             type='market',
-            time_in_force='gtc',
-            order_class='bracket',
-            stop_loss={
-                'stop_price': float(stop_loss_price),
-                'limit_price': float(stop_loss_limit_price)
-            },
-            take_profit={
-                'limit_price': float(take_profit_price)
-            }
+            time_in_force='gtc'
         )
 
-        logging.info(f"Bracket order submitted for {symbol} (Order ID: {bracket_order.id}).")
+        # Poll until filled or timeout (10s)
+        for _ in range(10):
+            ord = api.get_order(temp_order.id)
+            if ord.filled_at:
+                break
+            time.sleep(1)
+
+        ord = api.get_order(temp_order.id)
+        if not ord.filled_at:
+            api.cancel_order(temp_order.id)
+            return jsonify({"error": "Initial order not filled in time."}), 500
+
+        filled_price = Decimal(ord.filled_avg_price)
+
+        # Calculate SL/TP based on filled price
+        if side == 'buy':
+            sl = (filled_price * (1 - STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
+            tp = (filled_price * (1 + STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
+        else:
+            sl = (filled_price * (1 + STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
+            tp = (filled_price * (1 - STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
+
+        stop_loss_dist = abs(filled_price - sl)
+        pos_size_risk_based = RISK_DOLLAR / stop_loss_dist
+        max_position_size = MAX_CAPITAL_ALLOCATION / filled_price
+        qty = math.floor(min(pos_size_risk_based, max_position_size))
+
+        if qty <= 0:
+            return jsonify({"message": "Calculated position size is zero."}), 200
+
+        logging.info(f"Submitting final order for {qty} shares at side {side} with SL={sl}, TP={tp}")
+
+        # Submit final market order with correct qty
+        final_order = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type='market',
+            time_in_force='gtc'
+        )
+
+        # Wait for fill
+        for _ in range(10):
+            fo_status = api.get_order(final_order.id)
+            if fo_status.filled_at:
+                break
+            time.sleep(1)
+
+        fo_status = api.get_order(final_order.id)
+        if not fo_status.filled_at:
+            api.cancel_order(final_order.id)
+            return jsonify({"error": "Final order did not fill in time."}), 500
+
+        filled_price = Decimal(fo_status.filled_avg_price)
+
+        # Recalculate SL/TP with actual fill price
+        if side == 'buy':
+            sl = (filled_price * (1 - STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
+            tp = (filled_price * (1 + STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
+        else:
+            sl = (filled_price * (1 + STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
+            tp = (filled_price * (1 - STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
+
+        # Submit SL order
+        sl_order = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side='sell' if side == 'buy' else 'buy',
+            type='stop',
+            stop_price=float(sl),
+            time_in_force='gtc'
+        )
+        # Submit TP order
+        tp_order = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side='sell' if side == 'buy' else 'buy',
+            type='limit',
+            limit_price=float(tp),
+            time_in_force='gtc'
+        )
+
+        logging.info(f"Submitted SL ({sl_order.id}) and TP ({tp_order.id}) orders.")
+
+        # Poll for fill on SL/TP for up to 60s
+        for _ in range(60):
+            sl_status = api.get_order(sl_order.id)
+            tp_status = api.get_order(tp_order.id)
+            if sl_status.filled_at:
+                api.cancel_order(tp_order.id)
+                logging.info("Stop-loss filled, take-profit canceled.")
+                break
+            elif tp_status.filled_at:
+                api.cancel_order(sl_order.id)
+                logging.info("Take-profit filled, stop-loss canceled.")
+                break
+            time.sleep(1)
+
         return jsonify({
-            "message": f"Order placed for {symbol} with SL={stop_loss_price:.4f} and TP={take_profit_price:.4f}",
-            "order_id": bracket_order.id
+            "message": f"Order filled at {filled_price}, SL={sl}, TP={tp}, Qty={qty}"
         }), 200
 
     except tradeapi.rest.APIError as e:
-        logging.error(f"API Error: {e}")
-        return jsonify({"error": f"API Error: {e.status_code}"}), 500
+        logging.error(f"Alpaca API Error: {e}")
+        return jsonify({"error": str(e)}), 500
     except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-        return jsonify({"error": "Unexpected error."}), 500
+        logging.error(f"Unhandled error: {e}", exc_info=True)
+        return jsonify({"error": "Unhandled server error"}), 500
 
-# --- Application Entry Point ---
 if __name__ == "__main__":
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host="0.0.0.0", port=5000)
