@@ -24,8 +24,8 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Alpaca API Setup ---
-API_KEY = 'YOUR_ALPACA_API_KEY' # Replace with your actual API Key
-API_SECRET = 'YOUR_ALPACA_API_SECRET' # Replace with your actual API Secret
+API_KEY = 'PKEBE9SZ9SBF38BCV2MO' # Replace with your actual API Key
+API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq' # Replace with your actual API Secret
 BASE_URL = 'https://paper-api.alpaca.markets' # Use 'https://api.alpaca.markets' for live trading
 
 api = None
