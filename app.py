@@ -44,11 +44,6 @@ MAX_CAPITAL_ALLOCATION = Decimal('10000.0')
 MIN_TRADE_QTY = Decimal('1.0') # Minimum quantity to consider for a main trade (e.g., set to 2.0 if you never want to trade just 1 share)
 
 # --- Timezone Setup ---
-# Current time for cutoff check is June 30, 2025 at 2:28:03 PM PDT.
-# Klamath Falls, Oregon, United States observes Pacific Daylight Time (PDT).
-# Alpaca uses ET.
-# Ensure your webhook sender also sends time in a consistent manner, or that your bot
-# converts internal timestamps correctly for comparison.
 PT = ZoneInfo("America/Los_Angeles") # Pacific Time Zone
 CUTOFF_HOUR = 12 # 12 PM PT
 CUTOFF_MINUTE = 55 # 55 minutes past the hour (12:55 PM PT)
@@ -100,30 +95,63 @@ def webhook():
     entry_price_raw = data.get('price')
     action = data.get('action')
     # === CRITICAL FIX: Changed 'qty' to 'quantity' to match your webhook payload ===
-    qty_raw = data.get('quantity', None) # Correctly retrieve 'quantity' from webhook
+    # Retain the original 'qty_raw' for the special '0' check
+    qty_raw_from_webhook = data.get('quantity', None)
 
     if not all([symbol, action]):
         return jsonify({"error": "Missing required fields (symbol, action)."}), 400
 
     # --- Handle qty=0 signals specially ---
     # This block will now correctly trigger when 'quantity' is "0" or 0
-    if qty_raw == 0 or qty_raw == '0':
+    if qty_raw_from_webhook is not None and (qty_raw_from_webhook == 0 or str(qty_raw_from_webhook) == '0'):
         if is_after_cutoff():
-            logging.info(f"Qty=0 received after cutoff time, closing all positions.")
+            logging.info(f"Qty=0 received after cutoff time for {symbol}. Attempting to close all positions for this symbol.")
             try:
-                positions = api.list_positions()
-                if not positions:
-                    logging.info("No open positions found to close.")
-                    return jsonify({"message": "No positions to close after cutoff."}), 200
-                for position in positions:
-                    logging.info(f"Closing position for {position.symbol}, qty: {position.qty}")
-                    api.close_position(position.symbol)
-                return jsonify({"message": "Closed all positions after cutoff."}), 200
+                # Cancel all open orders for the specific symbol first
+                try:
+                    open_orders = api.list_orders(status="open", symbols=[symbol])
+                    for order in open_orders:
+                        logging.info(f"Cancelling open order {order.id} for {symbol} before closing position.")
+                        api.cancel_order(order.id)
+                    time.sleep(1)  # Short delay to ensure cancellations are processed
+                except Exception as e:
+                    logging.warning(f"Error cancelling open orders for {symbol} during cutoff closure: {e}", exc_info=True)
+
+                # Then attempt to close the position for that symbol
+                try:
+                    position_to_close = api.get_position(symbol)
+                    logging.info(f"Closing position for {position_to_close.symbol}, qty: {position_to_close.qty}")
+                    api.close_position(position_to_close.symbol)
+                    time.sleep(2) # Give Alpaca a moment
+
+                    # Verify closure
+                    try:
+                        api.get_position(symbol)
+                        logging.warning(f"Position for {symbol} not fully closed after qty=0 signal and cutoff.")
+                        return jsonify({"message": f"Attempted to close position for {symbol} but it might not be fully closed."}), 202
+                    except tradeapi.rest.APIError as e:
+                        if e.status_code == 404:
+                            logging.info(f"Position for {symbol} successfully closed after cutoff.")
+                            return jsonify({"message": f"Closed position for {symbol} after cutoff."}), 200
+                        else:
+                            logging.error(f"Error verifying position closure for {symbol} after cutoff: {e}", exc_info=True)
+                            return jsonify({"error": f"Failed to verify closure of position for {symbol}."}), 500
+                except tradeapi.rest.APIError as e:
+                    if e.status_code == 404:
+                        logging.info(f"No open position found for {symbol} to close after cutoff.")
+                        return jsonify({"message": f"No position for {symbol} to close after cutoff."}), 200
+                    else:
+                        logging.error(f"Error closing position for {symbol} during cutoff: {e}", exc_info=True)
+                        return jsonify({"error": f"Failed to close position for {symbol}."}), 500
+                except Exception as e:
+                    logging.error(f"Unhandled error during cutoff position closure for {symbol}: {e}", exc_info=True)
+                    return jsonify({"error": "Failed to close position after cutoff."}), 500
+
             except Exception as e:
-                logging.error(f"Error closing all positions: {e}", exc_info=True)
-                return jsonify({"error": "Failed to close all positions."}), 500
+                logging.error(f"Error handling qty=0 signal after cutoff: {e}", exc_info=True)
+                return jsonify({"error": "Failed to process cutoff closure."}), 500
         else:
-            logging.info(f"Qty=0 received before cutoff time ({CUTOFF_HOUR}:{CUTOFF_MINUTE} PT), ignoring signal.")
+            logging.info(f"Qty=0 received before cutoff time ({CUTOFF_HOUR}:{CUTOFF_MINUTE} PT) for {symbol}, ignoring signal.")
             return jsonify({"message": "Ignored qty=0 signal before cutoff time."}), 200
 
     # For non-zero qty or no qty signals, process normally
@@ -173,16 +201,27 @@ def webhook():
         if current_position and current_side != side:
             logging.info(f"Closing existing {current_side} position of {abs(current_qty)} shares for {symbol} before opening new {side} position.")
             try:
+                # --- CANCEL ANY OPEN ORDERS FOR THE SYMBOL (SL/TP) BEFORE CLOSING ---
+                try:
+                    open_orders = api.list_orders(status="open", symbols=[symbol])
+                    for order in open_orders:
+                        logging.info(f"Cancelling open order {order.id} for {symbol} before position reversal.")
+                        api.cancel_order(order.id)
+                    time.sleep(1)  # short delay to ensure cancellations are processed
+                except Exception as e:
+                    logging.warning(f"Error cancelling open orders for {symbol} during position reversal: {e}", exc_info=True)
+
+                # --- Attempt to close the position ---
                 api.close_position(symbol)
-                # Wait a moment for the closure to process
-                time.sleep(2)
-                # After closing, verify the position is gone or reduced
+                time.sleep(2)  # Give Alpaca a moment for closure to register
+
+                # --- Verify the position was fully closed ---
                 try:
                     remaining_position = api.get_position(symbol)
                     if remaining_position:
-                         logging.warning(f"Position for {symbol} not fully closed after reversal signal. Remaining: {remaining_position.qty}. Proceeding with new order might lead to unintended results.")
-                         # Depending on your strategy, you might want to return an error here
-                         # if partial closure is not acceptable for proceeding.
+                        logging.warning(f"Position for {symbol} not fully closed after reversal signal. Remaining: {remaining_position.qty}. Proceeding with new order might lead to unintended results.")
+                        # Depending on your strategy, you might want to return an error here
+                        # if partial closure is not acceptable for proceeding.
                 except tradeapi.rest.APIError as e:
                     if e.status_code == 404:
                         logging.info(f"Existing position for {symbol} successfully closed.")
@@ -192,9 +231,11 @@ def webhook():
                 except Exception as e:
                     logging.error(f"Unhandled error verifying position closure for {symbol}: {e}", exc_info=True)
                     return jsonify({"error": "Unhandled error verifying position closure."}), 500
+
             except Exception as e:
                 logging.error(f"Error closing existing position for {symbol}: {e}", exc_info=True)
                 return jsonify({"error": f"Failed to close existing position for {symbol}."}), 500
+
 
         # --- Initial 1-share probe order ---
         logging.info(f"Submitting 1-share probe order for {symbol} ({side}).")
@@ -234,11 +275,11 @@ def webhook():
         if side == 'buy':
             sl = (filled_price * (1 - STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
             tp = (filled_price * (1 + STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-            exit_side = 'sell' # To close a long position, you sell
+            # exit_side = 'sell' # To close a long position, you sell (not directly used here for submit_order)
         else: # side == 'sell' (for shorting)
             sl = (filled_price * (1 + STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
             tp = (filled_price * (1 - STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-            exit_side = 'buy' # To close a short position, you buy to cover
+            # exit_side = 'buy' # To close a short position, you buy to cover (not directly used here for submit_order)
 
         stop_loss_dist = abs(filled_price - sl)
         if stop_loss_dist == 0:
@@ -248,6 +289,15 @@ def webhook():
                 position_after_probe = api.get_position(symbol)
                 if position_after_probe and abs(Decimal(position_after_probe.qty)) > 0:
                     logging.info(f"Closing {position_after_probe.qty}-share probe position for {symbol} as calculated final qty is invalid.")
+                    # Cancel any potential child orders from the 1-share probe before closing
+                    try:
+                        open_probe_orders = api.list_orders(status="open", symbols=[symbol])
+                        for order in open_probe_orders:
+                            logging.info(f"Cancelling open order {order.id} for {symbol} before cleaning up zero SL probe.")
+                            api.cancel_order(order.id)
+                        time.sleep(1)
+                    except Exception as e:
+                        logging.warning(f"Error cancelling probe related orders for {symbol} before zero SL cleanup: {e}", exc_info=True)
                     api.close_position(symbol)
             except tradeapi.rest.APIError as e:
                 if e.status_code == 404: # Already closed or never opened
@@ -269,6 +319,15 @@ def webhook():
                 position_after_probe = api.get_position(symbol)
                 if position_after_probe and abs(Decimal(position_after_probe.qty)) > 0:
                     logging.info(f"Closing {position_after_probe.qty}-share probe position for {symbol} as calculated final qty is too small.")
+                    # Cancel any potential child orders from the 1-share probe before closing
+                    try:
+                        open_probe_orders = api.list_orders(status="open", symbols=[symbol])
+                        for order in open_probe_orders:
+                            logging.info(f"Cancelling open order {order.id} for {symbol} before cleaning up too small qty probe.")
+                            api.cancel_order(order.id)
+                        time.sleep(1)
+                    except Exception as e:
+                        logging.warning(f"Error cancelling probe related orders for {symbol} before too small qty cleanup: {e}", exc_info=True)
                     api.close_position(symbol)
             except tradeapi.rest.APIError as e:
                 if e.status_code == 404:
@@ -287,6 +346,16 @@ def webhook():
                ((side == 'buy' and Decimal(position_from_probe.qty) > 0) or \
                 (side == 'sell' and Decimal(position_from_probe.qty) < 0)):
                 logging.info(f"Closing 1-share probe position for {symbol} to prepare for full bracket order.")
+                # --- CANCEL ANY OPEN ORDERS FOR THE PROBE BEFORE CLOSING ---
+                try:
+                    open_probe_orders = api.list_orders(status="open", symbols=[symbol])
+                    for order in open_probe_orders:
+                        logging.info(f"Cancelling open order {order.id} for {symbol} before probe position close.")
+                        api.cancel_order(order.id)
+                    time.sleep(1)
+                except Exception as e:
+                    logging.warning(f"Error cancelling probe orders for {symbol} before probe close: {e}", exc_info=True)
+
                 api.close_position(symbol)
                 time.sleep(2) # Give Alpaca a moment for closure confirmation
                 # Verify it's gone
@@ -298,6 +367,10 @@ def webhook():
                         logging.info(f"1-share probe position for {symbol} successfully closed.")
                     else:
                         logging.error(f"Error verifying probe position closure for {symbol}: {e}", exc_info=True)
+                        return jsonify({"error": f"Failed to verify closure of probe position for {symbol}."}), 500
+                except Exception as e:
+                    logging.error(f"Unhandled error verifying probe position closure for {symbol}: {e}", exc_info=True)
+                    return jsonify({"error": "Unhandled error verifying probe position closure."}), 500
             else:
                 logging.info(f"No 1-share probe position found to close for {symbol} or it's not a 1-share position, which is unexpected after probe. Proceeding.")
         except tradeapi.rest.APIError as e:
