@@ -24,8 +24,8 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Alpaca API Setup ---
-API_KEY = 'PKEBE9SZ9SBF38BCV2MO' # !!! REPLACE WITH YOUR ACTUAL API KEY !!!
-API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq' # !!! REPLACE WITH YOUR ACTUAL API SECRET !!!
+API_KEY = 'YOUR_ALPACA_API_KEY' # !!! REPLACE WITH YOUR ACTUAL API KEY !!!
+API_SECRET = 'YOUR_ALPACA_SECRET_KEY' # !!! REPLACE WITH YOUR ACTUAL API SECRET !!!
 BASE_URL = 'https://paper-api.alpaca.markets' # Use 'https://api.alpaca.markets' for live trading
 
 api = None
@@ -45,6 +45,9 @@ MIN_TRADE_QTY = Decimal('1.0') # Minimum quantity to consider for a main trade (
 
 # --- Timezone Setup ---
 PT = ZoneInfo("America/Los_Angeles") # Pacific Time Zone
+# Market close is 4:00 PM ET (New York Time).
+# 4:00 PM ET = 1:00 PM PT (Pacific Time).
+# So, '5 minutes before market closure' means 12:55 PM PT.
 CUTOFF_HOUR = 12 # 12 PM PT
 CUTOFF_MINUTE = 55 # 55 minutes past the hour (12:55 PM PT)
 
@@ -91,67 +94,145 @@ def webhook():
     data = request.get_json()
     logging.info(f"Received webhook data: {json.dumps(data)}")
 
-    symbol = data.get('symbol')
+    symbol = data.get('symbol') # Keep symbol for logging context, though not strictly used for all positions closure in this block
     entry_price_raw = data.get('price')
     action = data.get('action')
     qty_raw_from_webhook = data.get('quantity', None)
 
-    if not all([symbol, action]):
+    if not all([symbol, action]): # symbol is still required for normal trade flow, keep this check
         return jsonify({"error": "Missing required fields (symbol, action)."}), 400
 
-    # --- Handle qty=0 signals specially ---
+    # --- Handle qty=0 signals specially for FULL PORTFOLIO LIQUIDATION ---
     if qty_raw_from_webhook is not None and (qty_raw_from_webhook == 0 or str(qty_raw_from_webhook) == '0'):
         if is_after_cutoff():
-            logging.info(f"Qty=0 received after cutoff time for {symbol}. Attempting to close all positions for this symbol.")
+            logging.info(f"Qty=0 received after cutoff time for {symbol}. Triggering full portfolio liquidation.")
+            liquidation_results = []
+            
             try:
-                # Cancel all open orders for the specific symbol first
-                try:
-                    open_orders = api.list_orders(status="open", symbols=[symbol])
-                    for order in open_orders:
-                        logging.info(f"Cancelling open order {order.id} for {symbol} before closing position.")
-                        api.cancel_order(order.id)
-                    time.sleep(1)  # Short delay to ensure cancellations are processed
-                except Exception as e:
-                    logging.warning(f"Error cancelling open orders for {symbol} during cutoff closure: {e}", exc_info=True)
+                logging.info("Cancelling all open orders across the portfolio.")
+                api.cancel_all_orders()
+                time.sleep(2) # Give Alpaca a moment to process cancellations
+                logging.info("All open orders cancellation initiated.")
+            except tradeapi.rest.APIError as e:
+                logging.warning(f"Error cancelling all open orders: {e}", exc_info=True)
+            except Exception as e:
+                logging.warning(f"Unhandled error cancelling all open orders: {e}", exc_info=True)
 
-                # Then attempt to close the position for that symbol
-                try:
-                    position_to_close = api.get_position(symbol)
-                    logging.info(f"Closing position for {position_to_close.symbol}, qty: {position_to_close.qty}")
-                    api.close_position(position_to_close.symbol)
-                    time.sleep(2) # Give Alpaca a moment
+            try:
+                positions = api.list_positions()
+                if not positions:
+                    logging.info("No open positions found to close during liquidation.")
+                    return jsonify({"message": "No positions to close during portfolio liquidation."}), 200
 
-                    # Verify closure
+                logging.info(f"Found {len(positions)} positions to close during liquidation.")
+
+                for pos in positions:
+                    pos_symbol = pos.symbol
+                    qty_to_close = abs(Decimal(pos.qty))
+                    closing_side = 'sell' if Decimal(pos.qty) > 0 else 'buy'
+
+                    logging.info(f"Attempting to close position for {pos_symbol}: {qty_to_close} shares, side: {closing_side}.")
+
+                    remaining_qty = qty_to_close
+                    max_attempts = 5 # Allow multiple attempts to close each position
+                    position_closed_fully = False
+
+                    for attempt in range(max_attempts):
+                        if remaining_qty <= 0:
+                            position_closed_fully = True
+                            break # Position for this symbol is fully closed
+
+                        logging.info(f"Closing attempt {attempt + 1}/{max_attempts} for {pos_symbol}. Remaining qty: {remaining_qty}.")
+                        try:
+                            # Submit a market order for the remaining quantity
+                            close_order = api.submit_order(
+                                symbol=pos_symbol,
+                                qty=remaining_qty,
+                                side=closing_side,
+                                type='market',
+                                time_in_force='day' # Day order for cutoff closure
+                            )
+                            logging.info(f"Submitted close order {close_order.id} for {pos_symbol} (Qty: {remaining_qty}, Side: {closing_side}).")
+
+                            # Poll for fill
+                            poll_timeout = 20 # seconds for each order
+                            poll_interval = 1 # seconds
+                            poll_start_time = time.time()
+                            order_filled_completely_in_poll = False
+
+                            while time.time() - poll_start_time < poll_timeout:
+                                ord_status = api.get_order(close_order.id)
+                                if ord_status.filled_qty and Decimal(ord_status.filled_qty) > 0:
+                                    filled_this_attempt = Decimal(ord_status.filled_qty)
+                                    if filled_this_attempt == remaining_qty:
+                                        logging.info(f"Close order {close_order.id} for {pos_symbol} fully filled: {filled_this_attempt} shares.")
+                                        remaining_qty = Decimal('0')
+                                        order_filled_completely_in_poll = True
+                                        break # Exit polling loop, position fully closed
+                                    else:
+                                        # Partially filled, update remaining qty for next attempt
+                                        logging.warning(f"Close order {close_order.id} for {pos_symbol} partially filled: {filled_this_attempt} of {remaining_qty}. Remaining to close: {remaining_qty - filled_this_attempt}.")
+                                        remaining_qty -= filled_this_attempt
+                                        break # Exit polling loop to retry with new remaining_qty
+                                elif ord_status.status in ['canceled', 'expired', 'rejected']:
+                                    logging.warning(f"Close order {close_order.id} for {pos_symbol} was {ord_status.status}. Remaining qty: {remaining_qty}.")
+                                    break # Exit polling loop, might need new order or it's gone
+                                logging.info(f"Close order {close_order.id} for {pos_symbol} not yet filled. Retrying in {poll_interval} second...")
+                                time.sleep(poll_interval)
+                            
+                            # If order wasn't fully filled or polling timed out, cancel it before next attempt
+                            if not order_filled_completely_in_poll and remaining_qty > 0:
+                                try:
+                                    api.cancel_order(close_order.id)
+                                    logging.warning(f"Cancelled partially filled/unfilled order {close_order.id} for {pos_symbol}. Remaining: {remaining_qty}.")
+                                    time.sleep(1) # Give Alpaca a moment
+                                except tradeapi.rest.APIError as e:
+                                    logging.warning(f"Could not cancel order {close_order.id} for {pos_symbol} (might be filled/done or already cancelled): {e}")
+
+                        except tradeapi.rest.APIError as e:
+                            logging.error(f"Alpaca API Error during close order submission/polling for {pos_symbol} (Attempt {attempt + 1}): {e}", exc_info=True)
+                            if "insufficient qty available for order" in str(e).lower():
+                                logging.warning(f"Insufficient quantity error for {pos_symbol}. This may indicate insufficient buying power to cover the short. Will retry or fail after max attempts.")
+                                time.sleep(1) # Short delay before next attempt
+                            else:
+                                logging.error(f"Unrecoverable API error during close attempt for {pos_symbol}: {e}. Aborting further retries for this symbol.")
+                                break # Break retry loop for unrecoverable errors
+                        except Exception as e:
+                            logging.error(f"Unhandled error during close order submission/polling for {pos_symbol} (Attempt {attempt + 1}): {e}", exc_info=True)
+                            break # Break retry loop for unhandled errors
+                    
+                    # Log final status for each position after all attempts
                     try:
-                        api.get_position(symbol)
-                        logging.warning(f"Position for {symbol} not fully closed after qty=0 signal and cutoff.")
-                        return jsonify({"message": f"Attempted to close position for {symbol} but it might not be fully closed."}), 202
+                        final_pos_check = api.get_position(pos_symbol)
+                        liquidation_results.append(f"{pos_symbol}: Failed to close fully. Remaining qty: {final_pos_check.qty}")
+                        logging.warning(f"Position for {pos_symbol} not fully closed after multiple attempts. Remaining qty: {final_pos_check.qty}.")
                     except tradeapi.rest.APIError as e:
                         if e.status_code == 404:
-                            logging.info(f"Position for {symbol} successfully closed after cutoff.")
-                            return jsonify({"message": f"Closed position for {symbol} after cutoff."}), 200
+                            liquidation_results.append(f"{pos_symbol}: Successfully closed.")
+                            logging.info(f"Position for {pos_symbol} successfully closed.")
                         else:
-                            logging.error(f"Error verifying position closure for {symbol} after cutoff: {e}", exc_info=True)
-                            return jsonify({"error": f"Failed to verify closure of position for {symbol}."}), 500
-                except tradeapi.rest.APIError as e:
-                    if e.status_code == 404:
-                        logging.info(f"No open position found for {symbol} to close after cutoff.")
-                        return jsonify({"message": f"No position for {symbol} to close after cutoff."}), 200
-                    else:
-                        logging.error(f"Error closing position for {symbol} during cutoff: {e}", exc_info=True)
-                        return jsonify({"error": f"Failed to close position for {symbol}."}), 500
-                except Exception as e:
-                    logging.error(f"Unhandled error during cutoff position closure for {symbol}: {e}", exc_info=True)
-                    return jsonify({"error": "Failed to close position after cutoff."}), 500
+                            liquidation_results.append(f"{pos_symbol}: Error verifying final status: {e}")
+                            logging.error(f"Error verifying final position closure for {pos_symbol}: {e}", exc_info=True)
+                    except Exception as e:
+                        liquidation_results.append(f"{pos_symbol}: Unhandled error verifying final status: {e}")
+                        logging.error(f"Unhandled error verifying final position closure for {pos_symbol}: {e}", exc_info=True)
 
+                return jsonify({"message": "Full portfolio liquidation attempted.", "details": liquidation_results}), 200
+
+            except tradeapi.rest.APIError as e:
+                logging.error(f"Alpaca API Error listing positions for liquidation: {e}", exc_info=True)
+                return jsonify({"error": f"Failed to list positions for liquidation: {e}"}), 500
             except Exception as e:
-                logging.error(f"Error handling qty=0 signal after cutoff: {e}", exc_info=True)
-                return jsonify({"error": "Failed to process cutoff closure."}), 500
+                logging.error(f"Unhandled error during full portfolio liquidation: {e}", exc_info=True)
+                return jsonify({"error": "Failed to process full portfolio liquidation."}), 500
         else:
-            logging.info(f"Qty=0 received before cutoff time ({CUTOFF_HOUR}:{CUTOFF_MINUTE} PT) for {symbol}, ignoring signal.")
-            return jsonify({"message": "Ignored qty=0 signal before cutoff time."}), 200
+            logging.info(f"Qty=0 received before cutoff time ({CUTOFF_HOUR}:{CUTOFF_MINUTE} PT) for {symbol}, ignoring signal for full liquidation.")
+            # For non-cutoff qty=0 signals, still provide a clear message.
+            return jsonify({"message": "Ignored qty=0 signal before cutoff time (not triggering full liquidation)."}), 200
 
-    # For non-zero qty or no qty signals, process normally
+    # --- For non-zero qty or no qty signals, process normally ---
+    # This is the existing logic for placing new bracket orders.
+    # It remains outside the 'qty=0' and 'after_cutoff' blocks.
 
     try:
         entry_price = Decimal(str(entry_price_raw)) if entry_price_raw else None
