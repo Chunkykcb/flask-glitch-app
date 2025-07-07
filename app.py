@@ -24,8 +24,8 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Alpaca API Setup ---
-API_KEY = 'PKEBE9SZ9SBF38BCV2MO' # Replace with your actual API Key
-API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq' # Replace with your actual API Secret
+API_KEY = 'PKEBE9SZ9SBF38BCV2MO' # !!! REPLACE WITH YOUR ACTUAL API KEY !!!
+API_SECRET = 'KGHVSTQi9cCqg0qkNUHFAHmhswdcDCjJW7EJxlnq' # !!! REPLACE WITH YOUR ACTUAL API SECRET !!!
 BASE_URL = 'https://paper-api.alpaca.markets' # Use 'https://api.alpaca.markets' for live trading
 
 api = None
@@ -94,15 +94,12 @@ def webhook():
     symbol = data.get('symbol')
     entry_price_raw = data.get('price')
     action = data.get('action')
-    # === CRITICAL FIX: Changed 'qty' to 'quantity' to match your webhook payload ===
-    # Retain the original 'qty_raw' for the special '0' check
     qty_raw_from_webhook = data.get('quantity', None)
 
     if not all([symbol, action]):
         return jsonify({"error": "Missing required fields (symbol, action)."}), 400
 
     # --- Handle qty=0 signals specially ---
-    # This block will now correctly trigger when 'quantity' is "0" or 0
     if qty_raw_from_webhook is not None and (qty_raw_from_webhook == 0 or str(qty_raw_from_webhook) == '0'):
         if is_after_cutoff():
             logging.info(f"Qty=0 received after cutoff time for {symbol}. Attempting to close all positions for this symbol.")
@@ -168,7 +165,7 @@ def webhook():
     if side is None:
         return jsonify({"error": "Invalid action. Must be 'buy' or 'sell'."}), 400
 
-    # --- Check short availability for 'sell' actions (ChatGPT suggestion) ---
+    # --- Check short availability for 'sell' actions ---
     if side == 'sell' and not check_short_availability(symbol):
         return jsonify({"error": f"Shorting {symbol} is not available at this time. Trade aborted."}), 400
 
@@ -185,57 +182,21 @@ def webhook():
             current_qty = Decimal(current_position.qty)
             current_side = 'buy' if current_qty > 0 else 'sell'
             logging.info(f"Existing position found for {symbol}: {current_side} {abs(current_qty)} shares.")
+
+            # --- NEW LOGIC: Abort if any position already exists for the symbol ---
+            if current_qty != 0:
+                logging.info(f"Position already exists for {symbol}: {current_qty} shares. Aborting new trade.")
+                return jsonify({"message": f"Trade aborted. Already holding position in {symbol}."}), 400
+
         except tradeapi.rest.APIError as e:
             if e.status_code == 404: # 404 means no position exists for this symbol
-                logging.info(f"No existing position for {symbol}.")
+                logging.info(f"No existing position for {symbol}. Proceeding with new order.")
             else:
                 logging.error(f"Error checking existing position for {symbol}: {e}", exc_info=True)
                 return jsonify({"error": f"Failed to check existing position for {symbol}."}), 500
         except Exception as e:
             logging.error(f"Unhandled error checking position for {symbol}: {e}", exc_info=True)
             return jsonify({"error": "Unhandled error checking position."}), 500
-
-
-        # If there's an existing position and the new signal is for the opposite side,
-        # close the existing position first.
-        if current_position and current_side != side:
-            logging.info(f"Closing existing {current_side} position of {abs(current_qty)} shares for {symbol} before opening new {side} position.")
-            try:
-                # --- CANCEL ANY OPEN ORDERS FOR THE SYMBOL (SL/TP) BEFORE CLOSING ---
-                try:
-                    open_orders = api.list_orders(status="open", symbols=[symbol])
-                    for order in open_orders:
-                        logging.info(f"Cancelling open order {order.id} for {symbol} before position reversal.")
-                        api.cancel_order(order.id)
-                    time.sleep(1)  # short delay to ensure cancellations are processed
-                except Exception as e:
-                    logging.warning(f"Error cancelling open orders for {symbol} during position reversal: {e}", exc_info=True)
-
-                # --- Attempt to close the position ---
-                api.close_position(symbol)
-                time.sleep(2)  # Give Alpaca a moment for closure to register
-
-                # --- Verify the position was fully closed ---
-                try:
-                    remaining_position = api.get_position(symbol)
-                    if remaining_position:
-                        logging.warning(f"Position for {symbol} not fully closed after reversal signal. Remaining: {remaining_position.qty}. Proceeding with new order might lead to unintended results.")
-                        # Depending on your strategy, you might want to return an error here
-                        # if partial closure is not acceptable for proceeding.
-                except tradeapi.rest.APIError as e:
-                    if e.status_code == 404:
-                        logging.info(f"Existing position for {symbol} successfully closed.")
-                    else:
-                        logging.error(f"Error verifying position closure for {symbol}: {e}", exc_info=True)
-                        return jsonify({"error": f"Failed to verify closure of existing position for {symbol}."}), 500
-                except Exception as e:
-                    logging.error(f"Unhandled error verifying position closure for {symbol}: {e}", exc_info=True)
-                    return jsonify({"error": "Unhandled error verifying position closure."}), 500
-
-            except Exception as e:
-                logging.error(f"Error closing existing position for {symbol}: {e}", exc_info=True)
-                return jsonify({"error": f"Failed to close existing position for {symbol}."}), 500
-
 
         # --- Initial 1-share probe order ---
         logging.info(f"Submitting 1-share probe order for {symbol} ({side}).")
@@ -275,11 +236,9 @@ def webhook():
         if side == 'buy':
             sl = (filled_price * (1 - STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
             tp = (filled_price * (1 + STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-            # exit_side = 'sell' # To close a long position, you sell (not directly used here for submit_order)
         else: # side == 'sell' (for shorting)
             sl = (filled_price * (1 + STOP_LOSS_PERCENT)).quantize(Decimal('0.01'))
             tp = (filled_price * (1 - STOP_LOSS_PERCENT * TAKE_PROFIT_RATIO)).quantize(Decimal('0.01'))
-            # exit_side = 'buy' # To close a short position, you buy to cover (not directly used here for submit_order)
 
         stop_loss_dist = abs(filled_price - sl)
         if stop_loss_dist == 0:
@@ -306,12 +265,13 @@ def webhook():
                     logging.error(f"Error closing probe position after zero SL calculation: {e}", exc_info=True)
             return jsonify({"error": "Calculated stop loss distance is zero, cannot proceed with trade."}), 500
 
+        # Calculate Position Size (based on available risk and capital allocation)
         pos_size_risk_based = RISK_DOLLAR / stop_loss_dist
         max_position_size = MAX_CAPITAL_ALLOCATION / filled_price
         
         qty = math.floor(min(pos_size_risk_based, max_position_size))
         
-        # --- Handle cases where calculated qty is too small or zero (ChatGPT suggestion) ---
+        # --- Handle cases where calculated qty is too small or zero ---
         if qty < MIN_TRADE_QTY:
             logging.info(f"Calculated total position size ({qty} shares) for {symbol} is less than minimum trade quantity ({MIN_TRADE_QTY}). Trade aborted.")
             # Close the 1-share probe position if it filled, as we're not proceeding with a main trade
