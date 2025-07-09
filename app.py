@@ -45,7 +45,7 @@ except Exception as e:
 # --- Risk Management Settings ---
 # Define parameters for risk management and position sizing.
 RISK_DOLLAR = Decimal('1000.0') # The maximum dollar amount to risk per trade.
-STOP_LOSS_PERCENT = Decimal('0.005') # Percentage of entry price for stop loss (0.5%).
+STOP_LOSS_PERCENT = Decimal('0.01') # Percentage of entry price for stop loss (1%).
 TAKE_PROFIT_RATIO = Decimal('2.0') # Risk-to-reward ratio for take profit (2:1).
 MAX_CAPITAL_ALLOCATION = Decimal('10000.0') # Maximum capital to allocate to a single position.
 MIN_TRADE_QTY = Decimal('1.0') # Minimum quantity to consider for a main trade (e.g., set to 2.0 if you never want to trade just 1 share).
